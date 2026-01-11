@@ -174,6 +174,7 @@ func newRaft(c *Config) *Raft {
 
 	log := newLog(c.Storage)
 	log.committed = hs.Commit
+	log.applied = c.Applied
 
 	r := Raft{
 		id:               c.ID,
@@ -638,5 +639,15 @@ func (r *Raft) appendEntry(es ...*pb.Entry) {
 		if len(r.peers) == 1 {
 			r.RaftLog.committed = li
 		}
+	}
+}
+
+func (r *Raft) softState() SoftState { return SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
 	}
 }
