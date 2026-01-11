@@ -73,12 +73,15 @@ func newLog(storage Storage) *RaftLog {
 		panic(err)
 	}
 
+	entries, _ := storage.Entries(firstIndex, lastIndex+1)
+	hs, _, _ := storage.InitialState()
+
 	return &RaftLog{
 		storage:   storage,
-		committed: firstIndex - 1,
+		committed: hs.Commit,
 		applied:   firstIndex - 1,
 		stabled:   lastIndex,
-		entries:   make([]pb.Entry, 0),
+		entries:   entries,
 	}
 }
 
@@ -93,14 +96,12 @@ func (l *RaftLog) maybeCompact() {
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.slice(l.firstIndex(), l.LastIndex()+1)
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.slice(l.stabled+1, l.LastIndex()+1)
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -109,52 +110,57 @@ func (l *RaftLog) nextEnts() []pb.Entry {
 }
 
 func (l *RaftLog) slice(lo, hi uint64) []pb.Entry {
-	{
-		if lo > hi {
-			panic(ErrOutOfRange)
-		}
+	if lo == hi {
+		return make([]pb.Entry, 0)
+	}
 
-		fi, li := l.firstIndex(), l.LastIndex()
-		if lo < fi {
-			panic(ErrCompacted)
-		}
-
-		if hi > li+1 {
-			panic(ErrOutOfRange)
-		}
+	if lo > hi {
+		panic(ErrOutOfRange)
 	}
 
 	var offset uint64
-	if ll := len(l.entries); ll > 0 {
+	if len(l.entries) > 0 {
 		offset = l.entries[0].Index
 	} else {
-		ents, err := l.storage.Entries(lo, hi)
-		if err != nil {
-			panic(err)
-		}
-		return ents
+		ents, _ := l.storage.Entries(lo, hi)
+		dst := make([]pb.Entry, len(ents))
+		copy(dst, ents)
+		return dst
 	}
 
-	if hi < offset {
-		ents, err := l.storage.Entries(lo, hi)
-		if err != nil {
-			panic(err)
-		}
-		return ents
-	}
-
+	// Full in memory slice
 	if lo >= offset {
-		return l.entries[lo-offset : hi-offset]
+		src := l.entries[lo-offset : hi-offset]
+		dst := make([]pb.Entry, len(src))
+		copy(dst, src)
+		return dst
 	}
 
-	stored, err := l.storage.Entries(lo, offset)
-	if err != nil {
-		panic(err)
+	// Full in storage slice
+	if hi < offset {
+		ents, _ := l.storage.Entries(lo, hi)
+		dst := make([]pb.Entry, len(ents))
+		copy(dst, ents)
+		return dst
 	}
+
+	// Part in both
+	stored, _ := l.storage.Entries(lo, offset)
 
 	stored = append(stored, l.entries[0:hi-offset]...)
 
-	return stored
+	dst := make([]pb.Entry, len(stored))
+	copy(dst, stored)
+
+	return dst
+}
+
+func (l *RaftLog) firstIndex() uint64 {
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil && len(l.entries) > 0 {
+		return l.entries[0].Index
+	}
+	return firstIndex
 }
 
 // LastIndex return the last index of the log entries
@@ -169,30 +175,13 @@ func (l *RaftLog) LastIndex() uint64 {
 	return lastIndex
 }
 
-func (l *RaftLog) firstIndex() uint64 {
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index + 1
-	}
-
-	i, err := l.storage.FirstIndex()
-	if err != nil {
-		panic(err)
-	}
-
-	return i
-}
-
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if length := uint64(len(l.entries)); length > 0 && l.entries[0].Index <= i && i <= l.entries[length-1].Index {
 		firstIndex := l.entries[0].Index
 		return l.entries[i-firstIndex].Term, nil
 	}
-	term, err := l.storage.Term(i)
-	if err != nil && i == l.pendingSnapshot.Metadata.Index {
-		return l.pendingSnapshot.Metadata.Term, nil
-	}
-	return term, err
+	return l.storage.Term(i)
 }
 
 func (l *RaftLog) MustTerm(i uint64) uint64 {
@@ -209,6 +198,32 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 	}
 
 	l.entries = append(l.entries, ents...)
+
+	return l.LastIndex()
+}
+
+func (l *RaftLog) truncateAppend(ents ...pb.Entry) uint64 {
+	if len(ents) == 0 {
+		return l.LastIndex()
+	}
+
+	var offset uint64
+	if len(l.entries) > 0 {
+		offset = l.entries[0].Index
+	}
+	fromIndex := ents[0].Index
+
+	switch {
+	case fromIndex == offset+uint64(len(l.entries)):
+		l.entries = append(l.entries, ents...)
+	case len(l.entries) == 0:
+		l.entries = ents
+	default:
+		keep := l.slice(offset, fromIndex)
+		l.entries = append(keep, ents...)
+	}
+
+	l.stabled = min(l.stabled, fromIndex-1)
 
 	return l.LastIndex()
 }
